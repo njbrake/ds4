@@ -1,0 +1,43 @@
+# ds4 auth gate. Tailscale Funnel terminates TLS on :443 and forwards plain
+# HTTP to this listener on :9000. An exact bearer token is required, else 401.
+# The token is supplied as $LLM_API_TOKEN (read from ./.token by run-bridge.sh).
+{
+	admin off
+}
+
+:9000 {
+	# Listen on loopback only -- the funnel connects from this same host, so a
+	# wildcard bind would needlessly expose the gate to the LAN. This must be
+	# `bind`; putting a hostname in the site address instead would match on the
+	# Host header and 400 the funnel's requests.
+	bind 127.0.0.1
+
+	@authorized header Authorization "Bearer {$LLM_API_TOKEN}"
+
+	handle @authorized {
+		# A 500k-token prompt is only ~2MB of JSON; 32MB leaves generous
+		# headroom. Safe to be roomy because everything here is already
+		# authenticated by the bearer check above.
+		request_body {
+			max_size 32MB
+		}
+
+		reverse_proxy 127.0.0.1:8000 {
+			# ds4 streams tokens as text/event-stream; -1 forces an immediate
+			# flush so nothing is buffered.
+			flush_interval -1
+
+			# A ~500k-token prefill on Metal can take many minutes before the
+			# first token is emitted. Caddy's default 5m read timeout would cut
+			# that off, so raise both to 60m.
+			transport http {
+				read_timeout 60m
+				write_timeout 60m
+			}
+		}
+	}
+
+	handle {
+		respond "Unauthorized" 401
+	}
+}

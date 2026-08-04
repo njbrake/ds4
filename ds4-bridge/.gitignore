@@ -1,0 +1,9 @@
+# Secret -- never commit the bearer token.
+.token
+
+# Bundled caddy binary (~50MB, platform-specific). Install via `brew install
+# caddy` or restore from otari-bridge/native/caddy.
+caddy
+
+# Runtime logs.
+*.log
