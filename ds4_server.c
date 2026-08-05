@@ -11054,6 +11054,20 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* Partial live reuse.  None of the exact/continuation strategies matched the
+     * whole live buffer, but the request still shares a long token prefix with
+     * it -- typically everything up to the previous assistant/tool turn, whose
+     * sampled tokens re-render differently on the way back in.  Rewinding the
+     * live checkpoint to that prefix lets ds4_session_sync() resume from there
+     * (it resumes only when the prompt starts with the full checkpoint), instead
+     * of evicting to a shorter disk snapshot and re-prefilling the remainder.
+     * Gated on min_tokens so a trivial shared prefix still falls through to the
+     * disk path below, which may hold a longer match. */
+    if (cached == 0 && common < old_pos && common >= s->kv.opt.min_tokens) {
+        ds4_session_rewind(slot->session, common);
+        cached = common;
+        cache_source = "memory-token-partial";
+    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
