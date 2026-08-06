@@ -12342,9 +12342,10 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
     } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
+        /* Advertise only the DeepSeek model that is actually loaded (flash vs
+         * pro), not the whole family -- listing a model the server can't serve
+         * is misleading to clients doing model discovery. */
+        append_model_json(&b, s, server_model_id_from_engine(s->engine));
     }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
