@@ -944,6 +944,20 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
+/* Which model ids this engine actually serves (mirrors send_models): GLM
+ * advertises its three thinking-mode aliases; DeepSeek advertises only the
+ * loaded model (flash vs pro). Used to 404 the single-model route and reject
+ * inference for a model this server can't serve. */
+static bool server_model_alias_served(ds4_engine *engine, const char *id) {
+    if (!id) return false;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return !strcmp(id, "glm-5.2") ||
+               !strcmp(id, "glm-5.2-chat") ||
+               !strcmp(id, "glm-5.2-reasoner");
+    }
+    return !strcmp(id, server_model_id_from_engine(engine));
+}
+
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
@@ -12389,7 +12403,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_alias_served(s->engine, hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -12426,6 +12440,20 @@ static void *client_main(void *arg) {
     if (!req.model_from_request) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
+    }
+    /* A client that explicitly asks for a known model this server does not
+     * serve (e.g. deepseek-v4-pro on a Flash-only server) is rejected rather
+     * than silently answered by the loaded model. Unknown/free-form model
+     * strings still pass through and are answered by the loaded model. */
+    if (req.model_from_request && server_model_alias_known(req.model) &&
+        !server_model_alias_served(s->engine, req.model)) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "model \"%s\" is not available on this server",
+                 req.model ? req.model : "");
+        http_error(fd, s->enable_cors, 404, msg);
+        request_free(&req);
+        goto done;
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
