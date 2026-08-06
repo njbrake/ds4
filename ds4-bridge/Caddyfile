@@ -1,5 +1,5 @@
 # ds4 auth gate. Tailscale Funnel terminates TLS on :443 and forwards plain
-# HTTP to this listener on :9000. An exact bearer token is required, else 401.
+# HTTP to this listener on :9000. An exact token is required, else 401.
 # The token is supplied as $LLM_API_TOKEN (read from ./.token by run-bridge.sh).
 {
 	admin off
@@ -12,12 +12,24 @@
 	# Host header and 400 the funnel's requests.
 	bind 127.0.0.1
 
-	@authorized header Authorization "Bearer {$LLM_API_TOKEN}"
+	# Accept the token in EITHER header:
+	#   Authorization: Bearer <token>   (OpenAI-style clients, curl)
+	#   x-api-key: <token>              (Anthropic-native clients)
+	# Matchers inside one block are ANDed, so @noauth means (no valid Bearer)
+	# AND (no valid x-api-key) -- i.e. the token is absent from both. A request
+	# carrying it in either header falls through to the authorized handler.
+	@noauth {
+		not header Authorization "Bearer {$LLM_API_TOKEN}"
+		not header X-Api-Key "{$LLM_API_TOKEN}"
+	}
+	handle @noauth {
+		respond "Unauthorized" 401
+	}
 
-	handle @authorized {
+	handle {
 		# A 500k-token prompt is only ~2MB of JSON; 32MB leaves generous
 		# headroom. Safe to be roomy because everything here is already
-		# authenticated by the bearer check above.
+		# authenticated by the check above.
 		request_body {
 			max_size 32MB
 		}
@@ -35,9 +47,5 @@
 				write_timeout 60m
 			}
 		}
-	}
-
-	handle {
-		respond "Unauthorized" 401
 	}
 }

@@ -21,10 +21,16 @@ CADDY_LOG="$BRIDGE_DIR/caddy.log"
 PROXY_PORT=9000
 
 # Model / performance knobs (see README for the reasoning behind each).
-DS4_CTX=500000              # matches the pi client's assumed max; model native max is 1M
+DS4_CTX=200000              # observed peak usage ~81k; 200k keeps ~2.4x headroom while
+                           # keeping KV checkpoints small (bigger ctx bloats disk cache).
+                           # Bump toward 256k+ only if a client actually sends larger prompts.
 DS4_POWER=100              # GPU duty-cycle target, 1..100
 KV_DISK_DIR=/tmp/ds4-kv
-KV_DISK_MB=65536           # 64GB on-disk KV checkpoint budget
+KV_DISK_MB=131072          # 128GB on-disk KV checkpoint budget (491GB SSD free)
+DS4_BATCH=4                # N resident KV sessions: each client conversation gets
+                           # its own slot (prefix-affinity routing) so concurrent
+                           # clients don't evict each other. Each slot's KV scales
+                           # with ctx (~4GB/slot at 500k); prefill workspace is shared.
 
 # Prefer a caddy on PATH; fall back to the bundled binary.
 command -v caddy >/dev/null 2>&1 && CADDY_BIN="caddy"
@@ -66,6 +72,7 @@ echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=
 ( cd "$REPO_DIR" && exec caffeinate -i ./ds4-server \
 	--power "$DS4_POWER" --ctx "$DS4_CTX" \
 	--kv-disk-dir "$KV_DISK_DIR" --kv-disk-space-mb "$KV_DISK_MB" \
+	--batched-session "$DS4_BATCH" \
 	--host 127.0.0.1 --port 8000 ) > "$DS4_LOG" 2>&1 &
 DS4_PID=$!
 
