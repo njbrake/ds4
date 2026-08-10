@@ -32,6 +32,14 @@ DS4_BATCH=4                # resident KV slots. Claude Code spawns sub-agents (e
                            # separate conversation); a slot each keeps them from
                            # evicting one another (single-slot thrashes on /autoplan-
                            # style multi-agent workloads). Also covers concurrent clients.
+DS4_DSPARK=1               # DSpark speculative decoding (draft model for Flash 0731):
+                           # the draft proposes up to 5 tokens, Flash verifies and
+                           # commits the accepted prefix -> faster DECODE on predictable
+                           # /code continuations. Does NOT speed prefill. Adds ~5.6GB
+                           # draft weights + verifier state, so it tightens the budget --
+                           # watch the startup "memory:" line and drop DS4_BATCH if it
+                           # crowds 128GB. Checkpoint-specific: 0731 draft <-> 0731 Flash.
+DS4_MTP="$REPO_DIR/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
 
 # Prefer a caddy on PATH; fall back to the bundled binary.
 command -v caddy >/dev/null 2>&1 && CADDY_BIN="caddy"
@@ -68,12 +76,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Optional DSpark draft-model flags, appended only when enabled.
+DSPARK_ARGS=()
+if [ "${DS4_DSPARK:-0}" = "1" ]; then
+	[ -e "$DS4_MTP" ] || { echo "[bridge] DSpark enabled but missing $DS4_MTP -- run: ./download_model.sh ds4f-dspark"; exit 1; }
+	DSPARK_ARGS=(--mtp "$DS4_MTP" --dspark)
+	echo "[bridge] DSpark ON (draft: $(basename "$DS4_MTP"))"
+fi
+
 # --- 1. ds4-server (loopback only; the proxy is the sole reachable path) ---
 echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=$DS4_CTX) -> $DS4_LOG"
 ( cd "$REPO_DIR" && exec caffeinate -i ./ds4-server \
 	--power "$DS4_POWER" --ctx "$DS4_CTX" \
 	--kv-disk-dir "$KV_DISK_DIR" --kv-disk-space-mb "$KV_DISK_MB" \
 	--batched-session "$DS4_BATCH" \
+	${DSPARK_ARGS[@]+"${DSPARK_ARGS[@]}"} \
 	--host 127.0.0.1 --port 8000 ) > "$DS4_LOG" 2>&1 &
 DS4_PID=$!
 
