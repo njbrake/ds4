@@ -40,6 +40,13 @@ DS4_DSPARK=1               # DSpark speculative decoding (draft model for Flash 
                            # watch the startup "memory:" line and drop DS4_BATCH if it
                            # crowds 128GB. Checkpoint-specific: 0731 draft <-> 0731 Flash.
 DS4_MTP="$REPO_DIR/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+DS4_TRACE=""               # DIAGNOSTIC ONLY. Set to a path (e.g. /tmp/ds4-trace.log)
+                           # to have ds4-server dump per-request cache decisions --
+                           # on a token-mismatch miss it prints the 8 tokens either
+                           # side of the divergence, cached vs incoming, as decoded
+                           # text. Reveals what the client re-renders each turn and
+                           # breaks the prefix cache. Verbose + contains conversation
+                           # text, so keep it under /tmp and blank for normal runs.
 
 # Prefer a caddy on PATH; fall back to the bundled binary.
 command -v caddy >/dev/null 2>&1 && CADDY_BIN="caddy"
@@ -88,6 +95,14 @@ if [ "${DS4_DSPARK:-0}" = "1" ]; then
 	echo "[bridge] DSpark ON (draft: $(basename "$DS4_MTP"))"
 fi
 
+# Optional per-request cache-decision trace (diagnostic).
+TRACE_ARGS=()
+if [ -n "${DS4_TRACE:-}" ]; then
+	TRACE_ARGS=(--trace "$DS4_TRACE")
+	: > "$DS4_TRACE" 2>/dev/null || true   # truncate so we only capture this run
+	echo "[bridge] request tracing ON -> $DS4_TRACE (diagnostic; blank DS4_TRACE to disable)"
+fi
+
 # --- 1. ds4-server (loopback only; the proxy is the sole reachable path) ---
 echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=$DS4_CTX) -> $DS4_LOG"
 ( cd "$REPO_DIR" && exec caffeinate -i ./ds4-server \
@@ -95,6 +110,7 @@ echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=
 	--kv-disk-dir "$KV_DISK_DIR" --kv-disk-space-mb "$KV_DISK_MB" \
 	--batched-session "$DS4_BATCH" \
 	${DSPARK_ARGS[@]+"${DSPARK_ARGS[@]}"} \
+	${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"} \
 	--host 127.0.0.1 --port 8000 ) > "$DS4_LOG" 2>&1 &
 DS4_PID=$!
 
