@@ -66,11 +66,15 @@ fi
 FUNNEL_HOST="$("$TS" status --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" 2>/dev/null)"
 [ -z "$FUNNEL_HOST" ] && FUNNEL_HOST="<your-node>.<tailnet>.ts.net"
 
-DS4_PID=""; CADDY_PID=""
+DS4_PID=""; CADDY_PID=""; TAIL_PID=""
 cleanup() {
 	echo; echo "[bridge] shutting down..."
 	[ -n "$CADDY_PID" ] && kill "$CADDY_PID" 2>/dev/null
 	[ -n "$DS4_PID" ] && kill "$DS4_PID" 2>/dev/null
+	# The tail is backgrounded (different process group), so Ctrl-C's SIGINT
+	# never reaches it -- kill it here or each restart orphans one, and every
+	# leaked tail reprints the whole log into the pane (10x duplicate lines).
+	[ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null
 	"$TS" funnel --https=443 off 2>/dev/null
 	echo "[bridge] funnel off, processes stopped."
 }
@@ -115,4 +119,5 @@ cat <<EOF
 ----------------------------------------------------------------
 EOF
 tail -n +1 -f "$DS4_LOG" "$CADDY_LOG" &
+TAIL_PID=$!
 wait
