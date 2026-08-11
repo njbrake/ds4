@@ -7654,8 +7654,12 @@ typedef struct {
     anthropic_tool_stream tool;
 } anthropic_stream;
 
-static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
-                                     int prompt_tokens, anthropic_stream *st) {
+/* Emit just the Anthropic `message_start` event.  Split out from stream-state
+ * init so it can be sent early -- at the first prefill-progress callback, before
+ * prefill finishes -- which lets a gateway commit the first chunk immediately
+ * instead of timing out its first-chunk wait during a long prefill. */
+static bool anthropic_sse_emit_message_start(int fd, const request *r,
+                                             const char *id, int prompt_tokens) {
     buf b = {0};
     json_escape(&b, r->model);
     char *model_json = buf_take(&b);
@@ -7670,12 +7674,22 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     bool ok = sse_event(fd, "message_start", b.ptr);
     buf_free(&b);
     free(model_json);
+    return ok;
+}
 
+static void anthropic_stream_init_state(anthropic_stream *st, const request *r,
+                                        bool active) {
     memset(st, 0, sizeof(*st));
-    st->active = ok;
+    st->active = active;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
     st->guard_second_reasoning =
         ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+}
+
+static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
+                                     int prompt_tokens, anthropic_stream *st) {
+    bool ok = anthropic_sse_emit_message_start(fd, r, id, prompt_tokens);
+    anthropic_stream_init_state(st, r, ok);
     return ok;
 }
 
@@ -10213,6 +10227,8 @@ typedef struct {
     bool stream_failed;
     double last_keepalive;
     job *request_job;
+    const char *id;             /* response id, set before prefill so the */
+    bool anthropic_start_sent;  /* keepalive can emit message_start early */
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -10617,19 +10633,37 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
      * A failed write marks the job cancelled; the session callback then stops
      * prefill at the next backend-safe boundary. */
+    const bool anthropic = p->request_job && p->request_job->req.api == API_ANTHROPIC;
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
-                p->last_keepalive = now;
-            } else {
+            if (!sse_headers(p->fd, p->enable_cors)) {
                 p->stream_failed = true;
                 job_mark_cancelled(p->request_job);
                 return;
             }
+            p->last_keepalive = now;
+            /* Emit message_start now, mid-prefill, so the gateway commits its
+             * first chunk instead of hitting its first-chunk timeout on a long
+             * prefill.  The decode path then skips re-sending it. */
+            if (anthropic && p->id) {
+                if (anthropic_sse_emit_message_start(p->fd, &p->request_job->req,
+                                                     p->id, p->prompt_tokens)) {
+                    p->anthropic_start_sent = true;
+                } else {
+                    p->stream_failed = true;
+                    job_mark_cancelled(p->request_job);
+                    return;
+                }
+            }
         } else if (now - p->last_keepalive >= 5.0) {
-            static const char ka[] = ": prefill\n\n";
-            if (send_all(p->fd, ka, sizeof(ka) - 1)) {
+            /* Anthropic clients count events, not bytes: a `:` comment is
+             * invisible to them, so send a real ping event instead. */
+            static const char ka_ping[] = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+            static const char ka_comment[] = ": prefill\n\n";
+            const char *ka = anthropic ? ka_ping : ka_comment;
+            size_t ka_len = (anthropic ? sizeof(ka_ping) : sizeof(ka_comment)) - 1;
+            if (send_all(p->fd, ka, ka_len)) {
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
@@ -11319,6 +11353,35 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
+        /* Instrumentation only (no KV-logic change): explain why the
+         * visible-prefix / tool-id live continuations did not fire, to localize
+         * the gap for full-history re-render turns. */
+        const char *pt = j->req.prompt_text;
+        size_t pt_len = pt ? strlen(pt) : 0;
+        pthread_mutex_lock(&s->tool_mu);
+        bool tl_valid = slot->thinking_live.valid;
+        int tl_live = slot->thinking_live.live_tokens;
+        size_t tl_vlen = slot->thinking_live.visible_len;
+        const char *tl_vtext = slot->thinking_live.visible_text;
+        size_t vmatch = 0;
+        if (tl_vtext && pt) {
+            size_t lim = tl_vlen < pt_len ? tl_vlen : pt_len;
+            while (vmatch < lim && tl_vtext[vmatch] == pt[vmatch]) vmatch++;
+        }
+        pthread_mutex_unlock(&s->tool_mu);
+        const char *why =
+            !tl_valid ? "not-armed" :
+            tl_live != old_pos ? "live-tokens-moved" :
+            !tl_vtext ? "no-visible-text" :
+            vmatch < tl_vlen ? "visible-text-diverged" :
+            tl_vlen >= pt_len ? "prompt-not-longer" :
+            "WOULD-MATCH(other-gate)";
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: miss-diag prompt=%d old=%d thinking_live{valid=%d "
+                   "live=%d vlen=%zu vmatch=%zu -> %s} anthropic{ids=%d suffix=%d}",
+                   j->req.prompt.len, old_pos, tl_valid, tl_live, tl_vlen, vmatch, why,
+                   j->req.anthropic_live_call_ids.len,
+                   j->req.anthropic_live_suffix_text ? 1 : 0);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -11359,6 +11422,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
+    /* Generate the response id before prefill so the prefill-progress callback
+     * can emit message_start early (see server_progress_cb). */
+    const uint64_t response_seq = server_next_sequence(s);
+    char id[96];
+    snprintf(id, sizeof(id), "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)response_seq);
     server_prefill_progress progress = {
         .srv = s,
         .slot = slot,
@@ -11372,6 +11442,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
         .request_job = j,
+        .id = id,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
@@ -11535,12 +11606,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
-    const uint64_t response_seq = server_next_sequence(s);
-    char id[96];
-    snprintf(id, sizeof(id), "%s-%llu",
-             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)response_seq);
-
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
@@ -11576,14 +11641,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             return;
         }
         progress.headers_sent = true;
-        if (j->req.api == API_ANTHROPIC &&
-            !anthropic_sse_start_live(j->fd, &j->req, id,
-                                      prompt_tokens, &anthropic_live)) {
-            job_mark_cancelled(j);
-            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            request_live_state_clear(s, slot);
-            ds4_tokens_free(&effective_prompt);
-            return;
+        if (j->req.api == API_ANTHROPIC) {
+            if (progress.anthropic_start_sent) {
+                /* message_start already went out mid-prefill; just set up the
+                 * stream state the decode path needs. */
+                anthropic_stream_init_state(&anthropic_live, &j->req, true);
+            } else if (!anthropic_sse_start_live(j->fd, &j->req, id,
+                                                 prompt_tokens, &anthropic_live)) {
+                job_mark_cancelled(j);
+                server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+                request_live_state_clear(s, slot);
+                ds4_tokens_free(&effective_prompt);
+                return;
+            }
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
