@@ -32,7 +32,8 @@ DS4_BATCH=4                # resident KV slots. Claude Code spawns sub-agents (e
                            # separate conversation); a slot each keeps them from
                            # evicting one another (single-slot thrashes on /autoplan-
                            # style multi-agent workloads). Also covers concurrent clients.
-DS4_DSPARK=1               # DSpark speculative decoding (draft model for Flash 0731):
+DS4_DSPARK="${DS4_DSPARK:-1}"  # DSpark speculative decoding (draft model for Flash 0731):
+                           # env-overridable (DS4_DSPARK=0 to A/B without --mtp/--dspark).
                            # the draft proposes up to 5 tokens, Flash verifies and
                            # commits the accepted prefix -> faster DECODE on predictable
                            # /code continuations. Does NOT speed prefill. Adds ~5.6GB
@@ -40,7 +41,20 @@ DS4_DSPARK=1               # DSpark speculative decoding (draft model for Flash 
                            # watch the startup "memory:" line and drop DS4_BATCH if it
                            # crowds 128GB. Checkpoint-specific: 0731 draft <-> 0731 Flash.
 DS4_MTP="$REPO_DIR/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
-DS4_TRACE=""               # DIAGNOSTIC ONLY. Set to a path (e.g. /tmp/ds4-trace.log)
+DS4_MIXED_QUANTUM="${DS4_MIXED_QUANTUM:-2048}"  # tokens of prefill run per turn
+                           # when a decode is co-resident on another slot. ds4
+                           # shares one GPU executor, so a big COLD prefill and a
+                           # concurrent decode take turns. The stock 128 ping-pongs
+                           # so finely it's lose-lose: measured on this box a 20k
+                           # cold prefill overlapping a decode ran at 136 t/s (vs
+                           # 293 solo) AND starved the decode to ~1 t/s. At 2048 the
+                           # prefill hits its full 308 t/s, so the whole contention
+                           # window is ~2.3x shorter -- both conversations unblock
+                           # sooner. No prefill headroom above 2048. Exported as
+                           # DS4_SERVER_MIXED_PREFILL_QUANTUM below.
+DS4_TRACE="${DS4_TRACE:-}"  # DIAGNOSTIC ONLY. Set to a path (e.g. /tmp/ds4-trace.log)
+                           # -- env-overridable so a diagnostic run can flip it on
+                           # without editing this file (export DS4_TRACE=/tmp/... first).
                            # to have ds4-server dump per-request cache decisions --
                            # on a token-mismatch miss it prints the 8 tokens either
                            # side of the divergence, cached vs incoming, as decoded
@@ -103,8 +117,11 @@ if [ -n "${DS4_TRACE:-}" ]; then
 	echo "[bridge] request tracing ON -> $DS4_TRACE (diagnostic; blank DS4_TRACE to disable)"
 fi
 
+# Scheduler tuning read from the environment by ds4-server (see DS4_MIXED_QUANTUM).
+export DS4_SERVER_MIXED_PREFILL_QUANTUM="$DS4_MIXED_QUANTUM"
+
 # --- 1. ds4-server (loopback only; the proxy is the sole reachable path) ---
-echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=$DS4_CTX) -> $DS4_LOG"
+echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=$DS4_CTX, mixed_quantum=$DS4_MIXED_QUANTUM) -> $DS4_LOG"
 ( cd "$REPO_DIR" && exec caffeinate -i ./ds4-server \
 	--power "$DS4_POWER" --ctx "$DS4_CTX" \
 	--kv-disk-dir "$KV_DISK_DIR" --kv-disk-space-mb "$KV_DISK_MB" \

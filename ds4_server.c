@@ -10594,6 +10594,22 @@ static bool should_remember_thinking_checkpoint(const request *r,
     return true;
 }
 
+/* Counterpart gate for the tool-context (reasoning-preserving) case that
+ * should_remember_thinking_checkpoint deliberately excludes.  A no-tool-call
+ * assistant turn in a tool conversation is exactly the turn the tool-output-id
+ * continuation cannot help with (there is no tool call to bind to), and it is
+ * where full-history re-renders diverge once the client drops the reasoning. */
+static bool should_remember_preserve_reasoning_checkpoint(const request *r,
+                                                          const thinking_state *thinking,
+                                                          const char *finish) {
+    if (!r || r->kind != REQ_CHAT) return false;
+    if (!r->prompt_preserves_reasoning) return false;
+    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    if (thinking && thinking->inside) return false;
+    return true;
+}
+
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -10827,6 +10843,54 @@ static char *build_toolless_thinking_visible_text(const request *r,
     return buf_take(&visible);
 }
 
+/* Tool-context counterpart of build_toolless_thinking_visible_text.
+ *
+ * When the prompt PRESERVES reasoning (a tool conversation: schemas present or
+ * tool/tool-call history -> chat_history_uses_tool_context true), the renderer
+ * keeps the <think>...</think> tags for every assistant turn and expects the
+ * client to echo the reasoning back.  Anthropic clients (Claude Code) instead
+ * drop the reasoning on replay, so an aged assistant turn re-renders as an
+ * EMPTY block "<think></think>content" while the live KV holds the real
+ * reasoning.  That divergence forces a full re-prefill from the first such turn
+ * (antirez/ds4#609).
+ *
+ * The live token frontier already ends with the generation-prompt "<think>", so
+ * the visible projection the client will send next turn is exactly:
+ *
+ *   prompt-including-final-<think> + </think> + visible-content + eos
+ *
+ * i.e. an empty think block.  Remembering that as the visible key lets the next
+ * full-history re-render continue forward from the reasoning-rich live KV
+ * instead of re-prefilling.  Like the tool-less path this only remembers a key;
+ * it never rewrites KV, so a wrong guess is a safe no-op (the byte-prefix match
+ * simply fails and callers fall back to token/text/disk matching). */
+static char *build_preserve_reasoning_visible_text(const request *r,
+                                                   const char *content) {
+    if (!r || !r->prompt_text) return NULL;
+    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+    if (!r->prompt_preserves_reasoning) return NULL;
+    /* eos token below is DeepSeek-specific; GLM renders empty reasoning too but
+     * with different end-of-turn bytes, so leave it to the fallback there. */
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) return NULL;
+
+    size_t pt_len = strlen(r->prompt_text);
+    const char *think_tag = "<think>";
+    size_t tag_len = strlen(think_tag);
+    if (pt_len < tag_len ||
+        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        return NULL;
+    }
+
+    buf visible = {0};
+    /* Keep the trailing "<think>" (unlike the tool-less builder) and close it
+     * empty, matching the client's <think></think> re-render. */
+    buf_append(&visible, r->prompt_text, pt_len);
+    buf_puts(&visible, "</think>");
+    buf_puts(&visible, content ? content : "");
+    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    return buf_take(&visible);
+}
+
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content) {
@@ -10839,6 +10903,23 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
                ctx, ds4_session_pos(slot->session), strlen(visible));
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), strlen(visible));
+    free(visible);
+}
+
+static void remember_preserve_reasoning_checkpoint(server *s, server_slot *slot,
+                                                   const job *j, const char *ctx,
+                                                   uint64_t trace_id,
+                                                   const char *content) {
+    char *visible = build_preserve_reasoning_visible_text(&j->req, content);
+    if (!visible) return;
+
+    thinking_live_remember(s, slot, visible);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: preserve-reasoning visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(visible));
+    trace_event(s, trace_id,
+                "preserve-reasoning visible checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(slot->session), strlen(visible));
     free(visible);
 }
@@ -12295,6 +12376,15 @@ decode_again:
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
+    } else if (!parsed_calls.len &&
+               should_remember_preserve_reasoning_checkpoint(&j->req, &thinking,
+                                                             final_finish)) {
+        /* Tool conversation, no tool call this turn: arm the visible checkpoint
+         * so the next full-history re-render (which drops this turn's reasoning)
+         * continues from live KV instead of re-prefilling from the divergence
+         * point.  See antirez/ds4#609. */
+        remember_preserve_reasoning_checkpoint(s, slot, j, ctx_span, trace_id,
+                                               parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -13477,6 +13567,21 @@ int main(int argc, char **argv) {
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    /* DIAGNOSTIC/TUNING: override the mixed prefill/decode quantum without a
+     * recompile.  When a decode is co-resident, a cold prefill advances in
+     * chunks of this many tokens between decode opportunities.  Larger = the
+     * prefill finishes faster (less starvation window) but the concurrent
+     * decode gets fewer slots while it runs; smaller = fairer to the decode
+     * but a longer, slower prefill.  Mirrors DS4_SERVER_DECODE_COALESCE_US. */
+    {
+        const char *env = getenv("DS4_SERVER_MIXED_PREFILL_QUANTUM");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 1 && v <= 65536)
+                s.mixed_prefill_quantum = (int)v;
+        }
+    }
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
@@ -17337,6 +17442,20 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+
+    /* Preserve-reasoning gate is the inverse: it fires exactly for the
+     * tool-context turns the tool-less gate excludes, regardless of has_tools. */
+    r.think_mode = DS4_THINK_HIGH;
+    st.inside = false;
+    r.prompt_preserves_reasoning = true;
+    r.has_tools = true;
+    TEST_ASSERT(should_remember_preserve_reasoning_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_preserve_reasoning_checkpoint(&r, &st, "length"));
+    st.inside = true;
+    TEST_ASSERT(!should_remember_preserve_reasoning_checkpoint(&r, &st, "stop"));
+    st.inside = false;
+    r.prompt_preserves_reasoning = false;   /* tool-less -> other gate handles it */
+    TEST_ASSERT(!should_remember_preserve_reasoning_checkpoint(&r, &st, "stop"));
 
     request_free(&r);
 }
