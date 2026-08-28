@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
 
@@ -37,6 +38,8 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
 static int set_nonblock(int fd, bool on, int *old_flags);
 static bool agent_parse_bool_default(const char *s, bool def);
+static int agent_read_file_bytes(const char *path, char **data, size_t *len,
+                                 char *err, size_t errlen);
 
 /* ============================================================================
  * Configuration, Worker State, And Streaming Types
@@ -50,6 +53,7 @@ static bool agent_parse_bool_default(const char *s, bool def);
 
 typedef struct {
     const char *prompt;
+    char *prompt_owned;
     const char *system;
     const char *trace_path;
     bool raw_prompt;
@@ -605,8 +609,49 @@ static agent_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.engine.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-agent: %s\n",
+                    tp_parse_err[0] ? tp_parse_err :
+                    "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
+            if (c.gen.prompt) {
+                fprintf(stderr,
+                        "ds4-agent: specify only one of -p/--prompt and --prompt-file\n");
+                exit(2);
+            }
             c.gen.prompt = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--prompt-file")) {
+            if (c.gen.prompt) {
+                fprintf(stderr,
+                        "ds4-agent: specify only one of -p/--prompt and --prompt-file\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            size_t prompt_len = 0;
+            char err[256] = {0};
+            if (agent_read_file_bytes(path,
+                                      &c.gen.prompt_owned,
+                                      &prompt_len,
+                                      err,
+                                      sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-agent: %s\n", err);
+                exit(2);
+            }
+            c.gen.prompt = c.gen.prompt_owned;
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
@@ -620,14 +665,14 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
+            c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
-        } else if (!strcmp(arg, "--glm-mtp")) {
-            c.engine.glm_mtp = true;
-        } else if (!strcmp(arg, "--glm-mtp-timing")) {
+        } else if (!strcmp(arg, "--mtp-timing")) {
             c.engine.glm_mtp = true;
             c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
@@ -640,6 +685,8 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--mtp-exact-sampling")) {
+            c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -746,6 +793,14 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                          &c.engine.distributed,
+                                          tp_err,
+                                          sizeof(tp_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -754,13 +809,20 @@ static agent_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-agent: %s\n", dist_err);
         exit(2);
     }
-    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+    if (!ds4_tp_validate_engine_options(&c.engine,
+                                        tp_err,
+                                        sizeof(tp_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", tp_err);
+        exit(2);
+    }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER ||
+        c.engine.tp.role == DS4_TP_WORKER) {
         fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
     if (c.gen.raw_prompt && (!c.non_interactive || !c.gen.prompt)) {
         fprintf(stderr,
-                "ds4-agent: --raw-prompt is only supported with --non-interactive -p\n");
+                "ds4-agent: --raw-prompt requires --non-interactive and an initial prompt\n");
         exit(2);
     }
     return c;
@@ -1082,17 +1144,17 @@ static const char agent_glm_tools_prompt_rules_tail[] =
     "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
 
 static const char agent_glm_tool_schemas[] =
-    "{\"type\":\"function\",\"function\":{\"name\":\"google_search\",\"description\":\"Search web pages.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"visit_page\",\"description\":\"Read a URL in browser.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_sec\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"command\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash_status\",\"description\":\"Check a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash_stop\",\"description\":\"Stop a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a text file/range.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"number\"},\"max_lines\":{\"type\":\"number\"},\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"more\",\"description\":\"Continue previous read-like output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"number\"}}}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"write\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}}\n";
+    "{\"name\":\"google_search\",\"description\":\"Search web pages.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}}\n"
+    "{\"name\":\"visit_page\",\"description\":\"Read a URL in browser.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}\n"
+    "{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_sec\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"command\"]}}\n"
+    "{\"name\":\"bash_status\",\"description\":\"Check a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}\n"
+    "{\"name\":\"bash_stop\",\"description\":\"Stop a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}\n"
+    "{\"name\":\"read\",\"description\":\"Read a text file/range.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"number\"},\"max_lines\":{\"type\":\"number\"},\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}\n"
+    "{\"name\":\"more\",\"description\":\"Continue previous read-like output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"number\"}}}}\n"
+    "{\"name\":\"write\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}\n"
+    "{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
+    "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
+    "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n";
 
 static char *agent_build_glm_tools_prompt(bool edit_upto) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
@@ -4206,6 +4268,12 @@ static void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
     }
 }
 
+static bool agent_kv_payload_requires_rebuild(const agent_worker *w,
+                                              uint64_t payload_bytes) {
+    if (payload_bytes == 0) return true;
+    return w && w->cfg && ds4_tp_enabled(&w->cfg->engine.tp);
+}
+
 /* Load a KV file and optionally verify either its session identity or exact
  * rendered text.  sysprompt.kv uses exact text because the file name is fixed;
  * saved sessions use their filename SHA: modern agent sessions hash the title
@@ -4265,7 +4333,10 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     char load_err[160] = {0};
-    if (ok && hdr.payload_bytes == 0) {
+    if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
+        /* A saved payload contains only the leader's graph state. Rebuild from
+         * rendered text under TP so session_sync mirrors the same token prefix
+         * to the worker before either rank resumes decoding. */
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
@@ -6995,6 +7066,8 @@ static void test_agent_glm_tools_prompt_is_native(void) {
     AGENT_TEST_ASSERT(strstr(prompt, "<arg_key>") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "\"name\":\"bash\"") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "\"command\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "\"type\":\"function\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "\"function\":") == NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "put path first") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Emit at most one") == NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "<｜DSML｜") == NULL);
@@ -7066,10 +7139,23 @@ static void test_agent_cache_rejects_impossible_lengths(void) {
     fclose(fp);
 }
 
+static void test_agent_tp_cache_payload_rebuild_policy(void) {
+    agent_config cfg = {0};
+    agent_worker w = {
+        .cfg = &cfg,
+    };
+
+    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 0));
+    AGENT_TEST_ASSERT(!agent_kv_payload_requires_rebuild(&w, 1));
+    cfg.engine.tp.role = DS4_TP_LEADER;
+    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 1));
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_cache_rejects_impossible_lengths();
+    test_agent_tp_cache_payload_rebuild_policy();
     test_agent_read_default_lines_follow_context();
     test_agent_glm_template_policy();
     test_agent_edit_upto_prompt_is_opt_in();
@@ -8412,11 +8498,12 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
-static int worker_accept_generated_token(agent_worker *w,
+static int worker_finish_generated_token(agent_worker *w,
                                          int token,
                                          int *generated,
                                          double t0,
                                          agent_stream_renderer *stream,
+                                         bool evaluate,
                                          char *err,
                                          size_t err_len) {
     ds4_tokens_push(&w->transcript, token);
@@ -8428,7 +8515,8 @@ static int worker_accept_generated_token(agent_worker *w,
     free(text);
     (*generated)++;
 
-    if (ds4_session_eval(w->session, token, err, err_len) != 0) {
+    if (evaluate &&
+        ds4_session_eval(w->session, token, err, err_len) != 0) {
         ds4_session_invalidate(w->session);
         return 1;
     }
@@ -8440,6 +8528,17 @@ static int worker_accept_generated_token(agent_worker *w,
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     return 0;
+}
+
+static int worker_accept_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         agent_stream_renderer *stream,
+                                         char *err,
+                                         size_t err_len) {
+    return worker_finish_generated_token(w, token, generated, t0, stream,
+                                         true, err, err_len);
 }
 
 static int worker_force_generated_text(agent_worker *w,
@@ -8699,54 +8798,129 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 break;
             }
 
-            size_t text_len = 0;
-            char *text = ds4_token_text(w->engine, token, &text_len);
-            if (cfg->edit_upto &&
-                agent_edit_upto_forcer_should_replace(&upto_forcer, &dsml,
-                                                       text, text_len))
-            {
-                agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
-                            token, (int)(text_len > 80 ? 80 : text_len), text);
-                free(text);
-                if (worker_force_generated_text(w, "[upto]\n", max_tokens,
-                                                &generated, t0, &stream,
-                                                err, sizeof(err)) != 0) {
+            int toks[17];
+            int ntok = 0;
+            const int block_start = ds4_session_pos(w->session);
+            if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                ntok = ds4_session_eval_speculative(
+                    w->session, token, max_tokens - generated,
+                    ds4_token_eos(w->engine),
+                    greedy_sampling ? 0.0f : cfg->gen.temperature, 0,
+                    greedy_sampling ? 1.0f : cfg->gen.top_p,
+                    greedy_sampling ? 0.0f : cfg->gen.min_p,
+                    &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+                if (ntok < 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;
                 }
             } else {
-                free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
-                                                  &stream, err, sizeof(err)) != 0) {
+                if (ds4_session_eval(w->session, token,
+                                     err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;
                 }
+                toks[0] = token;
+                ntok = 1;
+            }
+            if (ntok == 0) {
+                agent_dsml_parser_free(&dsml);
+                agent_set_error(w, "decode returned no tokens");
+                return 1;
             }
 
-            greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
-            if (greedy_sampling != status_greedy_sampling) {
-                worker_set_greedy_sampling(w, greedy_sampling);
-                status_greedy_sampling = greedy_sampling;
-            }
+            bool stop_block = false;
+            bool restart_sampling = false;
+            for (int ti = 0; ti < ntok && generated < max_tokens; ti++) {
+                token = toks[ti];
+                if (ds4_token_is_stop_for_think_mode(w->engine,
+                                                     token,
+                                                     think_mode)) {
+                    ds4_session_rewind(w->session, block_start + ti);
+                    stop_block = true;
+                    break;
+                }
 
-            if (dsml.state == AGENT_DSML_DONE) {
-                got_tool = true;
-                break;
+                size_t text_len = 0;
+                char *text = ds4_token_text(w->engine, token, &text_len);
+                if (cfg->edit_upto &&
+                    agent_edit_upto_forcer_should_replace(&upto_forcer,
+                                                           &dsml,
+                                                           text,
+                                                           text_len))
+                {
+                    agent_trace(w,
+                                "edit old auto-upto replaced token=%d text=%.*s",
+                                token,
+                                (int)(text_len > 80 ? 80 : text_len),
+                                text);
+                    free(text);
+                    ds4_session_rewind(w->session, block_start + ti);
+                    if (worker_force_generated_text(w, "[upto]\n", max_tokens,
+                                                    &generated, t0, &stream,
+                                                    err, sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    restart_sampling = true;
+                    break;
+                }
+                free(text);
+                if (worker_finish_generated_token(w, token, &generated, t0,
+                                                  &stream, false,
+                                                  err, sizeof(err)) != 0) {
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, err);
+                    return 1;
+                }
+
+                const bool next_greedy =
+                    agent_stream_wants_greedy_sampling(&stream);
+                if (next_greedy != status_greedy_sampling) {
+                    worker_set_greedy_sampling(w, next_greedy);
+                    status_greedy_sampling = next_greedy;
+                }
+
+                if (dsml.state == AGENT_DSML_DONE) {
+                    got_tool = true;
+                    stop_block = true;
+                } else if (stream.tool_preflight_error) {
+                    early_tool_error = true;
+                    stop_block = true;
+                } else if (dsml.state == AGENT_DSML_ERROR ||
+                           stream.dsml_in_think) {
+                    malformed_tool = true;
+                    stop_block = true;
+                }
+                if (stop_block) {
+                    if (ti + 1 < ntok) {
+                        ds4_session_rewind(w->session,
+                                           block_start + ti + 1);
+                    }
+                    break;
+                }
+
+                if (ti + 1 < ntok && next_greedy != greedy_sampling) {
+                    /* Later tokens were proposed under the old parser mode.
+                     * Re-evaluate this boundary token to restore its logits,
+                     * then sample the suffix under the new mode. */
+                    ds4_session_rewind(w->session, block_start + ti);
+                    if (ds4_session_eval(w->session, token,
+                                         err, sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    restart_sampling = true;
+                    break;
+                }
             }
-            if (stream.tool_preflight_error) {
-                early_tool_error = true;
-                break;
-            }
-            if (dsml.state == AGENT_DSML_ERROR) {
-                malformed_tool = true;
-                break;
-            }
-            if (stream.dsml_in_think) {
-                malformed_tool = true;
-                break;
-            }
+            if (stop_block) break;
+            if (restart_sampling) continue;
         }
 
         bool interrupted = worker_should_interrupt(w);
@@ -8937,21 +9111,53 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        &rng);
         if (ds4_token_is_stop(w->engine, token)) break;
 
-        size_t text_len = 0;
-        char *text = ds4_token_text(w->engine, token, &text_len);
-        agent_trace_token(w, token, text, text_len, generated + 1);
-
-        if (ds4_session_eval(w->session, token, err, sizeof(err)) != 0) {
-            free(text);
-            agent_set_error(w, err[0] ? err : "raw decode failed");
+        int toks[17];
+        int ntok = 0;
+        const int block_start = ds4_session_pos(w->session);
+        if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative(
+                w->session, token, max_tokens - generated,
+                ds4_token_eos(w->engine), cfg->gen.temperature, 0,
+                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
+            if (ntok < 0) {
+                agent_set_error(w, err[0] ? err : "raw decode failed");
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+        } else {
+            if (ds4_session_eval(w->session, token, err, sizeof(err)) != 0) {
+                agent_set_error(w, err[0] ? err : "raw decode failed");
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+            toks[0] = token;
+            ntok = 1;
+        }
+        if (ntok == 0) {
+            agent_set_error(w, "raw decode returned no tokens");
             ds4_tokens_free(&prompt);
             return 1;
         }
 
-        ds4_tokens_push(&w->transcript, token);
-        agent_publish(w, text, text_len);
-        free(text);
-        generated++;
+        bool stop = false;
+        for (int ti = 0; ti < ntok && generated < max_tokens; ti++) {
+            token = toks[ti];
+            if (ds4_token_is_stop(w->engine, token)) {
+                ds4_session_rewind(w->session, block_start + ti);
+                stop = true;
+                break;
+            }
+            size_t text_len = 0;
+            char *text = ds4_token_text(w->engine, token, &text_len);
+            agent_trace_token(w, token, text, text_len, generated + 1);
+            ds4_tokens_push(&w->transcript, token);
+            agent_publish(w, text, text_len);
+            free(text);
+            generated++;
+        }
 
         double dt = now_sec() - t0;
         pthread_mutex_lock(&w->mu);
@@ -8959,6 +9165,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
         w->status.gen_tps = dt > 0.0 ? (double)generated / dt : 0.0;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
+        if (stop) break;
     }
 
     if (worker_should_interrupt(w)) {
@@ -11242,10 +11449,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
-    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
-        fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
-                cfg.chdir_path, strerror(errno));
-        return 1;
+    if (cfg.chdir_path) {
+        struct stat st;
+        if (stat(cfg.chdir_path, &st) != 0) {
+            fprintf(stderr, "ds4-agent: invalid working directory %s: %s\n",
+                    cfg.chdir_path, strerror(errno));
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "ds4-agent: %s is not a directory\n",
+                    cfg.chdir_path);
+            return 1;
+        }
     }
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
@@ -11286,7 +11501,46 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.gen.ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
+        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader,
+                                tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-agent: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
+
+    /* Model paths and Metal kernel sources are resolved from the launch
+     * directory. Tools should run in --chdir, so change directory only after
+     * the inference engine has finished opening. */
+    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
+        fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
+                cfg.chdir_path, strerror(errno));
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
+        ds4_engine_close(engine);
+        ds4_tp_free(tp_leader);
+        return 1;
+    }
 
     struct sigaction old_int;
     struct sigaction sa;
@@ -11301,7 +11555,10 @@ int main(int argc, char **argv) {
         run_agent(engine, &cfg);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
+    if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
+    ds4_tp_free(tp_leader);
+    free(cfg.gen.prompt_owned);
     return rc;
 }
 #endif
