@@ -992,6 +992,11 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
  * inference for a model this server can't serve. */
 static bool server_model_alias_served(ds4_engine *engine, const char *id) {
     if (!id) return false;
+    if (ds4_engine_is_glm53(engine)) {
+        return !strcmp(id, "glm-5.3-flash") ||
+               !strcmp(id, "glm-5.3-flash-chat") ||
+               !strcmp(id, "glm-5.3-flash-reasoner");
+    }
     if (ds4_engine_is_glm_dsa(engine)) {
         return !strcmp(id, "glm-5.2") ||
                !strcmp(id, "glm-5.2-chat") ||
@@ -10952,10 +10957,49 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * Instead, remember the visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
+/* GLM counterpart of the DeepSeek visible-text builders.
+ *
+ * GLM 5.x renders differently from DeepSeek, so the projection differs:
+ *   - the reasoning block is ALWAYS "<think></think>" tags (empty when the
+ *     client dropped the reasoning), for both tool and tool-less turns -- there
+ *     is no bare "</think>" form like DeepSeek's aged non-tool turns;
+ *   - assistant content is emitted via append_trimmed_text(), so we must trim
+ *     identically or the byte-prefix match fails;
+ *   - GLM appends NO end-of-turn token after assistant content (the next role
+ *     tag delimits the turn), so we append none either.
+ *
+ * The think-mode GLM prompt ends with the generation-prompt "<think>", so the
+ * client's next-turn render of this assistant turn is exactly
+ *   prompt-including-final-<think> + </think> + trimmed-content
+ * (then the next role tag).  Same rewind-free, safe-on-mismatch contract as the
+ * DeepSeek builders: it only remembers a visible key. */
+static char *build_glm_thinking_visible_text(const request *r,
+                                             const char *content) {
+    if (!r || !r->prompt_text) return NULL;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return NULL;
+    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+
+    size_t pt_len = strlen(r->prompt_text);
+    const char *think_tag = "<think>";
+    size_t tag_len = strlen(think_tag);
+    if (pt_len < tag_len ||
+        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        return NULL;
+    }
+
+    buf visible = {0};
+    buf_append(&visible, r->prompt_text, pt_len);   /* keep trailing "<think>" */
+    buf_puts(&visible, "</think>");
+    append_trimmed_text(&visible, content ? content : "");
+    return buf_take(&visible);
+}
+
 static char *build_toolless_thinking_visible_text(const request *r,
                                                   const char *content) {
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM)
+        return build_glm_thinking_visible_text(r, content);
 
     size_t pt_len = strlen(r->prompt_text);
     const char *think_tag = "<think>";
@@ -10999,9 +11043,9 @@ static char *build_preserve_reasoning_visible_text(const request *r,
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
     if (!r->prompt_preserves_reasoning) return NULL;
-    /* eos token below is DeepSeek-specific; GLM renders empty reasoning too but
-     * with different end-of-turn bytes, so leave it to the fallback there. */
-    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) return NULL;
+    /* GLM has its own render (empty <think></think>, trimmed content, no eos). */
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM)
+        return build_glm_thinking_visible_text(r, content);
 
     size_t pt_len = strlen(r->prompt_text);
     const char *think_tag = "<think>";
@@ -11575,9 +11619,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         size_t tl_vlen = slot->thinking_live.visible_len;
         const char *tl_vtext = slot->thinking_live.visible_text;
         size_t vmatch = 0;
+        char cwin[81] = {0}, pwin[81] = {0};   /* DIAG: bytes around divergence */
         if (tl_vtext && pt) {
             size_t lim = tl_vlen < pt_len ? tl_vlen : pt_len;
             while (vmatch < lim && tl_vtext[vmatch] == pt[vmatch]) vmatch++;
+            size_t s0 = vmatch > 24 ? vmatch - 24 : 0;
+            size_t ci = 0, pi = 0;
+            for (size_t k = s0; k < vmatch + 24 && k < tl_vlen && ci < 80; k++)
+                cwin[ci++] = tl_vtext[k] == '\n' ? '~' : tl_vtext[k];
+            for (size_t k = s0; k < vmatch + 24 && k < pt_len && pi < 80; k++)
+                pwin[pi++] = pt[k] == '\n' ? '~' : pt[k];
         }
         pthread_mutex_unlock(&s->tool_mu);
         const char *why =
@@ -11593,6 +11644,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.prompt.len, old_pos, tl_valid, tl_live, tl_vlen, vmatch, why,
                    j->req.anthropic_live_call_ids.len,
                    j->req.anthropic_live_suffix_text ? 1 : 0);
+        if (tl_valid && vmatch < tl_vlen) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: miss-diag @vmatch cached=[%s] prompt=[%s]",
+                       cwin, pwin);
+        }
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -12972,7 +13028,14 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (ds4_engine_is_glm53(s->engine)) {
+        /* GLM 5.3 Flash: advertise under its true name, not the 5.2 family. */
+        append_model_json(&b, s, "glm-5.3-flash");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "glm-5.3-flash-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "glm-5.3-flash-reasoner");
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");

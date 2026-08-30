@@ -20,27 +20,14 @@ DS4_LOG="$BRIDGE_DIR/ds4-server.log"
 CADDY_LOG="$BRIDGE_DIR/caddy.log"
 PROXY_PORT=9000
 
+# Model selector: "glm" (GLM 5.3 Flash Q2, default) or "deepseek" (V4 Flash 0731).
+# Rollback to DeepSeek is just: DS4_MODEL=deepseek ./run-bridge.sh
+DS4_MODEL="${DS4_MODEL:-glm}"
+
 # Model / performance knobs (see README for the reasoning behind each).
-DS4_CTX=400000              # autoplan sessions peak ~174k; 400k gives ~2.3x headroom and
-                           # still fits 4 slots (~6.8GB KV/slot, ~113GB total incl the 86GB
-                           # model). Model native max is 1M, but higher ctx needs fewer
-                           # slots for memory. Keep this in sync with what Otari advertises.
 DS4_POWER=100              # GPU duty-cycle target, 1..100
 KV_DISK_DIR=/tmp/ds4-kv
 KV_DISK_MB=131072          # 128GB on-disk KV checkpoint budget (491GB SSD free)
-DS4_BATCH=4                # resident KV slots. Claude Code spawns sub-agents (each a
-                           # separate conversation); a slot each keeps them from
-                           # evicting one another (single-slot thrashes on /autoplan-
-                           # style multi-agent workloads). Also covers concurrent clients.
-DS4_DSPARK="${DS4_DSPARK:-1}"  # DSpark speculative decoding (draft model for Flash 0731):
-                           # env-overridable (DS4_DSPARK=0 to A/B without --mtp/--dspark).
-                           # the draft proposes up to 5 tokens, Flash verifies and
-                           # commits the accepted prefix -> faster DECODE on predictable
-                           # /code continuations. Does NOT speed prefill. Adds ~5.6GB
-                           # draft weights + verifier state, so it tightens the budget --
-                           # watch the startup "memory:" line and drop DS4_BATCH if it
-                           # crowds 128GB. Checkpoint-specific: 0731 draft <-> 0731 Flash.
-DS4_MTP="$REPO_DIR/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
 DS4_MIXED_QUANTUM="${DS4_MIXED_QUANTUM:-2048}"  # tokens of prefill run per turn
                            # when a decode is co-resident on another slot. ds4
                            # shares one GPU executor, so a big COLD prefill and a
@@ -62,6 +49,40 @@ DS4_TRACE="${DS4_TRACE:-}"  # DIAGNOSTIC ONLY. Set to a path (e.g. /tmp/ds4-trac
                            # breaks the prefix cache. Verbose + contains conversation
                            # text, so keep it under /tmp and blank for normal runs.
 
+# --- derive per-model config ---------------------------------------------
+# ctx/slots/spec-decoding differ sharply between the two models. GLM 5.3 Q2's
+# KV (recurrent KDA + sparse DSA layers) is far heavier per token than
+# DeepSeek's compressed MLA, so it fits much less context on one 128GB box.
+if [ "$DS4_MODEL" = "glm" ]; then
+	MODEL_LABEL="GLM 5.3 Flash Q2"
+	MODEL_PATH="$REPO_DIR/gguf/GLM-5.3-Flash-Q2.gguf"
+	DS4_CTX="${DS4_CTX:-131072}"       # 128k x2 slots measured at ~115 GiB planned
+	                                   # (~13 GiB headroom). GLM's sparse DSA makes
+	                                   # ctx nearly free: 40k->128k added only ~3 GiB.
+	                                   # Can push higher if 180k+ sessions must fit
+	                                   # resident, at the cost of headroom.
+	DS4_BATCH="${DS4_BATCH:-2}"        # 2 resident slots (balanced choice).
+	SPEC_ARGS=(--mtp)                  # GLM's MTP block is embedded in the gguf.
+	SPEC_DESC="embedded MTP"
+elif [ "$DS4_MODEL" = "deepseek" ]; then
+	MODEL_LABEL="DeepSeek V4 Flash 0731"
+	# Explicit path, not ds4flash.gguf: download_model.sh repoints that symlink
+	# to whichever model it fetched last (now GLM), so it is not a stable alias.
+	MODEL_PATH="$REPO_DIR/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+	DS4_CTX="${DS4_CTX:-400000}"       # MLA compression fits 4 slots at 400k.
+	DS4_BATCH="${DS4_BATCH:-4}"
+	DS4_MTP="$REPO_DIR/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+	if [ "${DS4_DSPARK:-1}" = "1" ]; then
+		[ -e "$DS4_MTP" ] || { echo "[bridge] DSpark on but missing $DS4_MTP -- ./download_model.sh ds4f-dspark"; exit 1; }
+		SPEC_ARGS=(--mtp-model "$DS4_MTP" --dspark)   # NB: --mtp-model (flag refactored)
+		SPEC_DESC="DSpark draft ($(basename "$DS4_MTP"))"
+	else
+		SPEC_ARGS=(); SPEC_DESC="off"
+	fi
+else
+	echo "[bridge] unknown DS4_MODEL='$DS4_MODEL' (want glm|deepseek)"; exit 1
+fi
+
 # Prefer a caddy on PATH; fall back to the bundled binary.
 command -v caddy >/dev/null 2>&1 && CADDY_BIN="caddy"
 
@@ -73,7 +94,7 @@ TS="$(command -v tailscale || true)"
 # --- preflight ---
 [ -s "$TOKEN_FILE" ]           || { echo "[bridge] missing $TOKEN_FILE -- run: openssl rand -hex 32 > $TOKEN_FILE"; exit 1; }
 [ -x "$REPO_DIR/ds4-server" ]  || { echo "[bridge] no ds4-server at $REPO_DIR -- build it first (make ds4-server)"; exit 1; }
-[ -e "$REPO_DIR/ds4flash.gguf" ] || { echo "[bridge] missing $REPO_DIR/ds4flash.gguf"; exit 1; }
+[ -e "$MODEL_PATH" ] || { echo "[bridge] missing model $MODEL_PATH (DS4_MODEL=$DS4_MODEL)"; exit 1; }
 [ -x "$CADDY_BIN" ]            || { echo "[bridge] no caddy binary at $CADDY_BIN (brew install caddy, or restore ./caddy)"; exit 1; }
 export LLM_API_TOKEN="$(cat "$TOKEN_FILE")"
 
@@ -101,13 +122,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Optional DSpark draft-model flags, appended only when enabled.
-DSPARK_ARGS=()
-if [ "${DS4_DSPARK:-0}" = "1" ]; then
-	[ -e "$DS4_MTP" ] || { echo "[bridge] DSpark enabled but missing $DS4_MTP -- run: ./download_model.sh ds4f-dspark"; exit 1; }
-	DSPARK_ARGS=(--mtp "$DS4_MTP" --dspark)
-	echo "[bridge] DSpark ON (draft: $(basename "$DS4_MTP"))"
-fi
+echo "[bridge] model: $MODEL_LABEL  spec-decoding: $SPEC_DESC  ctx=$DS4_CTX slots=$DS4_BATCH"
 
 # Optional per-request cache-decision trace (diagnostic).
 TRACE_ARGS=()
@@ -121,12 +136,13 @@ fi
 export DS4_SERVER_MIXED_PREFILL_QUANTUM="$DS4_MIXED_QUANTUM"
 
 # --- 1. ds4-server (loopback only; the proxy is the sole reachable path) ---
-echo "[bridge] starting ds4-server (127.0.0.1:8000, DeepSeek V4 Flash 0731, ctx=$DS4_CTX, mixed_quantum=$DS4_MIXED_QUANTUM) -> $DS4_LOG"
+echo "[bridge] starting ds4-server (127.0.0.1:8000, $MODEL_LABEL, ctx=$DS4_CTX, mixed_quantum=$DS4_MIXED_QUANTUM) -> $DS4_LOG"
 ( cd "$REPO_DIR" && exec caffeinate -i ./ds4-server \
+	-m "$MODEL_PATH" \
 	--power "$DS4_POWER" --ctx "$DS4_CTX" \
 	--kv-disk-dir "$KV_DISK_DIR" --kv-disk-space-mb "$KV_DISK_MB" \
 	--batched-session "$DS4_BATCH" \
-	${DSPARK_ARGS[@]+"${DSPARK_ARGS[@]}"} \
+	${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
 	${TRACE_ARGS[@]+"${TRACE_ARGS[@]}"} \
 	--host 127.0.0.1 --port 8000 ) > "$DS4_LOG" 2>&1 &
 DS4_PID=$!
