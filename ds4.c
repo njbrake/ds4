@@ -62163,6 +62163,26 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+/* GLM 5.3 vision token budget. ds4_image_preprocess_glm53 resizes each image
+ * down to fit this many visual tokens. Upstream passes 8000, which lets a
+ * full-resolution photo (e.g. 4032x3024) produce a ~8000-token grid whose Metal
+ * encode stalls -- and because the encode runs under the server inference lock,
+ * a single such image wedges the whole server for all clients. A 1536px image
+ * (~2200 tokens) encodes reliably, so default the cap into that safe range;
+ * override with DS4_VISION_MAX_TOKENS (clamped to the 16..8000 the preprocessor
+ * accepts) to trade image detail for headroom. */
+static uint32_t ds4_vision_max_tokens(void) {
+    uint32_t v = 2048u;
+    const char *env = getenv("DS4_VISION_MAX_TOKENS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 16u && parsed <= 8000u)
+            v = (uint32_t)parsed;
+    }
+    return v;
+}
+
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
@@ -62203,7 +62223,7 @@ static int ds4_engine_vision_encode_image(
     }
 #endif
     ds4_image_patches patches = {0};
-    if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
+    if (!ds4_image_preprocess_glm53(&patches, image, 16u, ds4_vision_max_tokens(),
                                     error, error_cap)) return 0;
     float *embedding = malloc((size_t)patches.image_token_count *
                               4096u * sizeof(float));
