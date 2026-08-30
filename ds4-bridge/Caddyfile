@@ -27,11 +27,12 @@
 	}
 
 	handle {
-		# A 500k-token prompt is only ~2MB of JSON; 32MB leaves generous
-		# headroom. Safe to be roomy because everything here is already
-		# authenticated by the check above.
+		# A 500k-token prompt is only ~2MB of JSON; text is tiny. Vision
+		# changes this: GLM 5.3 accepts up to 16 base64 images, and ds4 caps
+		# the body at 64MB, so match that here (base64 inflates images ~33%).
+		# Safe to be roomy because everything here is already authenticated.
 		request_body {
-			max_size 32MB
+			max_size 64MB
 		}
 
 		reverse_proxy 127.0.0.1:8000 {

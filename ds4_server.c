@@ -12195,16 +12195,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         size_t tl_vlen = slot->thinking_live.visible_len;
         const char *tl_vtext = slot->thinking_live.visible_text;
         size_t vmatch = 0;
-        char cwin[81] = {0}, pwin[81] = {0};   /* DIAG: bytes around divergence */
         if (tl_vtext && pt) {
             size_t lim = tl_vlen < pt_len ? tl_vlen : pt_len;
             while (vmatch < lim && tl_vtext[vmatch] == pt[vmatch]) vmatch++;
-            size_t s0 = vmatch > 24 ? vmatch - 24 : 0;
-            size_t ci = 0, pi = 0;
-            for (size_t k = s0; k < vmatch + 24 && k < tl_vlen && ci < 80; k++)
-                cwin[ci++] = tl_vtext[k] == '\n' ? '~' : tl_vtext[k];
-            for (size_t k = s0; k < vmatch + 24 && k < pt_len && pi < 80; k++)
-                pwin[pi++] = pt[k] == '\n' ? '~' : pt[k];
         }
         pthread_mutex_unlock(&s->tool_mu);
         const char *why =
@@ -12220,11 +12213,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.prompt.len, old_pos, tl_valid, tl_live, tl_vlen, vmatch, why,
                    j->req.anthropic_live_call_ids.len,
                    j->req.anthropic_live_suffix_text ? 1 : 0);
-        if (tl_valid && vmatch < tl_vlen) {
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: miss-diag @vmatch cached=[%s] prompt=[%s]",
-                       cwin, pwin);
-        }
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&

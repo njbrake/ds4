@@ -64,6 +64,15 @@ if [ "$DS4_MODEL" = "glm" ]; then
 	DS4_BATCH="${DS4_BATCH:-2}"        # 2 resident slots (balanced choice).
 	SPEC_ARGS=(--mtp)                  # GLM's MTP block is embedded in the gguf.
 	SPEC_DESC="embedded MTP"
+	# Vision: separate 1.1GB encoder sidecar (text weights unchanged). Enabled
+	# only when present, so a missing encoder degrades to text-only, not a crash.
+	VISION_ENC="$REPO_DIR/gguf/GLM-5.3-Flash-Vision-Encoder.gguf"
+	if [ "${DS4_VISION:-1}" = "1" ] && [ -e "$VISION_ENC" ]; then
+		SPEC_ARGS+=(--vision "$VISION_ENC")
+		SPEC_DESC="$SPEC_DESC + vision"
+	elif [ "${DS4_VISION:-1}" = "1" ]; then
+		echo "[bridge] vision encoder not found ($VISION_ENC); running text-only. ./download_model.sh glm53-vision"
+	fi
 elif [ "$DS4_MODEL" = "deepseek" ]; then
 	MODEL_LABEL="DeepSeek V4 Flash 0731"
 	# Explicit path, not ds4flash.gguf: download_model.sh repoints that symlink
