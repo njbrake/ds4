@@ -448,8 +448,29 @@ block. A GLM 5.2 pass does not cover these paths.
 - Build and run the focused primitive test:
   `make tests/test_glm53_kda && ./tests/test_glm53_kda`.
   It covers BF16 projections, pool-4 state construction and expansion, grouped
-  scorer arithmetic and causal visibility, and recurrent KDA prefill versus
-  sequential decode.
+  scorer arithmetic and causal visibility, recurrent KDA prefill versus
+  sequential decode, and exact repeated causal-attention output on ROCm.
+- Treat session construction as the attention-memory admission point. Every
+  owned DSA cache and indexer pool/tail, every KDA recurrent state, and the
+  complete supported prefill workspace must allocate before a request is
+  accepted. A first prefill must not grow a per-layer cache. Check both a
+  4,096-token session and a long session in the memory report.
+- Keep GLM-5.3 in absorbed MLA form: attend densely over the shared compact
+  latent cache through token 4,096, then use the pool-4 sparse selector. Do not
+  restore the 2.75 GiB expanded per-head K/V cache as a presumed quality fix.
+  The complete Q2 fixture on the compact Metal graph scored NLL `0.458177271`,
+  first-token agreement `90/100`, and average greedy prefix `7.390`, matching
+  the accepted release band. Fresh Z.AI FP8 long-context controls also favored
+  compact attention: weighted NLL was `0.539823254` versus `0.820997888` for
+  expanded K/V over 24 synthetic cases, and `0.808160860` versus `0.820309487`
+  over 12 natural source-context cases. Extending dense attention to 16K made
+  the natural set worse at `0.825709092`, so keep the 4K crossover.
+- At 100K on an M5 Max, require the compact Q2 plan to remain near 94.09 GiB:
+  89.87 GiB model, 1.11 GiB compact history, and 3.11 GiB fixed graph buffers.
+  An 8,192-token one-shot control on the same graph reached 479.09 prefill and
+  29.89 steady decode t/s. Repeat the continuation fixture after changing the
+  compact cache type, absorbed projections, FlashAttention staging, or the 4K
+  crossover; numerical similarity to the old expanded graph is not the gate.
 - On this 128 GB M3 Max, run the resident Q2 through the generic non-NAX Metal
   path. Repeat the 4,096-4,100 boundary, official-continuation, MTP, snapshot,
   server-session, and continued-prefill gates used on M5. Record the different
@@ -539,6 +560,72 @@ block. A GLM 5.2 pass does not cover these paths.
   `DS4_TEST_CUDA_SINGLE_GPU=1 DS4_TEST_SESSION_COUNT=2`. Require
   `nonexact_logits=0`. Finally run the fused D2R kernels under CUDA memcheck;
   an argmax-only comparison or coherent text does not replace these gates.
+
+### GLM 5.3 Vision
+
+Vision is a separate sidecar on Metal, single-GPU CUDA, and ROCm, and has its
+own release gate. Text-only GLM success does not exercise image preprocessing,
+the vision graph, multimodal prompt spans, or image-aware KV identity.
+
+- Download `glm53-vision` and verify
+  `GLM-5.3-Flash-Vision-Encoder.gguf` has SHA-256
+  `ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a`.
+- Build `tests/test_glm53_vision_engine` and
+  `tests/test_glm53_vision_prompt`. Run them with the release Q2 text GGUF, the
+  vision sidecar, and a fixed PNG. The prompt test must generate a visual
+  answer, reuse an unchanged image without repeated prefill, and rebuild when
+  only the image fingerprint changes. It must also hold image-token positions
+  fixed, replace the visual embedding with zeros, and observe changed output
+  logits. Use a 4,096-token test session so a large screenshot plus the output
+  cannot hit the old 2,048-token test ceiling. After explicit session
+  invalidation, and again after restoring the zeroed embedding, require the
+  complete image-conditioned logits to match the original within `1e-6`.
+  This catches a compact-prefill path that processes placeholders but silently
+  ignores the image data, as well as incomplete multimodal state rebuilds.
+- Keep one accepted Metal embedding from a fixed image and compare CUDA and
+  ROCm output with `tests/compare_glm53_vision_embeddings.py`. Require finite
+  output, cosine similarity at least `0.995`, mean absolute error at most
+  `0.001`, and maximum absolute error at most `0.06`. This permits normal BF16
+  GEMM ordering differences but rejects a changed vision graph.
+- Run a fixed model-level vision fixture containing photographs, screenshots,
+  diagrams, readable text, spatial questions, and unrelated-image controls.
+  Compare complete answers with the official GLM-5.3-Flash vision service and
+  repeat through CLI, server, and `ds4-agent`. A valid decoder, expected image
+  token count, or plausible but ungrounded prose does not pass this gate. With
+  a local vision-enabled server running, require:
+
+  ```sh
+  python3 tests/run_glm53_vision_quality.py
+  ```
+
+  to report `6/6 passed`. For agent tests, expose only the raster fixtures;
+  source SVGs or expected-answer files beside them let the agent bypass vision
+  with text tools.
+- Run the decoder over RGB, RGBA, grayscale, and palette PNG, baseline and
+  progressive JPEG, EXIF orientation, truncated files, wrong CRCs, huge
+  dimensions, and decompression-bomb fixtures under ASan and UBSan. Invalid
+  files must fail without a sanitizer report or large allocation.
+- In `./ds4`, submit one PNG and one JPEG with `/read`, then continue each chat
+  with a text turn. Repeat once with `--mtp`; verification after image prefill
+  must complete without a GLM MTP failure.
+- In `ds4-agent`, require `view_image` to inspect a real file and use the
+  resulting multimodal observation in a later read/edit/test tool loop. Image
+  observations must enter as user-role multimodal turns; GLM loses grounding
+  when several images are packed into a tool-response role. Run the five-image
+  fixture in one turn so the prompt exceeds 4K, and require the same facts as
+  the official Z.AI control. Text-only tool observations must remain tool-role.
+- Through `ds4-server`, test OpenAI Chat data URIs, Responses `input_image`,
+  and Anthropic base64 image blocks. Include two images in one message and an
+  image in a later turn. Local paths, `file:` URLs, remote URLs, malformed
+  base64, unsupported media, more than 16 images, and bodies over 64 MiB must
+  return 4xx without reading local files or making network requests.
+- Run Q4 across `mac-m5max-us` and `mac-m5max-it` over explicit TB5 RDMA with
+  `--vision` on both ranks. The leader must encode once, both ranks must keep
+  matching multimodal KV state, and the answer must remain correct. Record
+  image encode, prefill, first-token, and decode timing separately.
+- Build CPU, CUDA, and ROCm targets warning-free after vision changes. Run the
+  encoder comparison, prompt replay test, and six-case server fixture on one
+  DGX Spark and on `strixhalo`; ROCm Q2 must use bounded SSD streaming.
 
 ## 7. SSD Streaming
 
@@ -850,6 +937,7 @@ claims across different models or contexts.
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token prefill and 256-token teacher-forced decode | about 214 t/s | about 16.7 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, resident short prompt | 86.68 t/s | 34.45 t/s; 41.97 t/s greedy MTP |
+| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 8,192-token compact-attention prompt | 479.09 t/s | 29.89 t/s steady |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, short prompt | 29.06 t/s | 32.70 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 24,988/49,948-token long prompts | 424.80 / 421.75 t/s | 29.50 / 28.10 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, 10,819-token prompt | 468.97 t/s | 22.85 t/s |

@@ -25,6 +25,7 @@ static int g_glm_model;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_GLM53_N_EXPERT = 288u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
     DS4_ROCM_N_EXPERT_USED = 8u,
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
@@ -4510,7 +4511,6 @@ static int cuda_stream_selected_apply(
         const char **down_w) {
     if (g_ssd_streaming_mode &&
         !g_stream_selected_cache.loaded &&
-        getenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED") != NULL &&
         cuda_stream_selected_pending_matches(model_map,
                                              layer,
                                              n_total_expert,
@@ -6170,6 +6170,25 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
      * either allocate the whole GGUF image or, for sparse span sets, an oversized
      * envelope before the precise tensor-span cache gets a chance to run.
      */
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_aux_model_map_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size) {
+    if (!model_map || model_size == 0 || map_size == 0 ||
+        map_offset > model_size || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
+    if (!cuda_model_range_copy_uncached(model_map, map_offset, map_size,
+                                        "GLM-5.3 vision encoder")) {
+        return 0;
+    }
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "mapped %.2f GiB auxiliary model\n",
+            (double)map_size / 1073741824.0);
     return 1;
 }
 

@@ -118,6 +118,11 @@ int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+/* Add a secondary GGUF mapping without replacing the primary model mapping. */
+int ds4_gpu_set_aux_model_map_range(const void *model_map,
+                                    uint64_t model_size,
+                                    uint64_t map_offset,
+                                    uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
@@ -1738,6 +1743,21 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
+/* Dense causal MLA over the shared compact latent cache. qk_low and lora_out
+ * are [token, head, kv_lora_dim]; the F16 cache is shared by all heads. */
+int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t              q_row0,
+        uint32_t              n_q,
+        uint32_t              n_kv,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_dim);
+
 int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
@@ -2912,6 +2932,66 @@ int ds4_gpu_glm53_matmul_bf16(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+#ifndef DS4_GLM53_VISION_TYPES_DEFINED
+#define DS4_GLM53_VISION_TYPES_DEFINED
+#define DS4_GLM53_VISION_LAYERS 24u
+
+typedef struct {
+    uint64_t norm1;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t q_norm;
+    uint64_t k_norm;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2;
+    uint64_t gate_weight;
+    uint64_t gate_bias;
+    uint64_t up_weight;
+    uint64_t up_bias;
+    uint64_t down_weight;
+    uint64_t down_bias;
+} ds4_glm53_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t post_norm;
+    uint64_t downsample_weight;
+    uint64_t downsample_bias;
+    uint64_t merger_proj;
+    uint64_t merger_norm;
+    uint64_t merger_norm_bias;
+    uint64_t merger_gate;
+    uint64_t merger_up;
+    uint64_t merger_down;
+    ds4_glm53_vision_layer_weights layer[DS4_GLM53_VISION_LAYERS];
+} ds4_glm53_vision_weights;
+#endif
+
+/* Encode normalized, block-major image patches into 4096-wide language-model
+ * embeddings. GPU implementations keep every intermediate on device. */
+int ds4_gpu_glm53_vision_encode(
+        float                          *out,
+        const float                    *patches,
+        uint32_t                        grid_h,
+        uint32_t                        grid_w,
+        const void                     *model_map,
+        uint64_t                        model_size,
+        const ds4_glm53_vision_weights *weights);
+
+/* Replace token rows with projected image embeddings and repeat each row into
+ * every GLM hyperconnection stream. Must be called in an active command batch. */
+int ds4_gpu_glm53_scatter_image_hc(
+        ds4_gpu_tensor       *hc,
+        const ds4_gpu_tensor *image,
+        uint32_t              dst_row,
+        uint32_t              image_row,
+        uint32_t              rows,
+        uint32_t              total_rows,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
 
 /* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
 int ds4_gpu_glm53_kda_decode(
