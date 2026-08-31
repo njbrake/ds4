@@ -81,6 +81,7 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    int imatrix_min_expert_samples;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -1273,6 +1274,7 @@ static void print_repl_help(void) {
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
+    puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
@@ -1283,6 +1285,18 @@ static bool parse_power_percent(const char *arg, int *out) {
     long v = strtol(arg, &end, 10);
     if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
     *out = (int)v;
+    return true;
+}
+
+static bool parse_steering_level(const char *arg, float *out) {
+    char *end = NULL;
+    errno = 0;
+    float v = strtof(arg, &end);
+    if (!arg[0] || *end != '\0' || errno == ERANGE || !isfinite(v) ||
+        v < -100.0f || v > 100.0f) {
+        return false;
+    }
+    *out = v;
     return true;
 }
 
@@ -1720,6 +1734,22 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     printf("Power: %d%%.\n", power);
                 }
             }
+        } else if (!strncmp(cmd, "/steer", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            char *arg = trim_inplace(cmd + 6);
+            if (!arg[0]) {
+                printf("Steering FFN: %g.\n",
+                       (double)ds4_session_directional_steering_ffn(chat.session));
+            } else {
+                float scale = 0.0f;
+                if (!parse_steering_level(arg, &scale)) {
+                    fprintf(stderr, "ds4: /steer must be between -100 and 100\n");
+                } else if (ds4_session_set_directional_steering_ffn(
+                                   chat.session, scale) == 0) {
+                    cfg->engine.directional_steering_ffn = scale;
+                    printf("Steering FFN: %g.\n", (double)scale);
+                }
+            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -2059,6 +2089,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-min-expert-samples")) {
+            c.gen.imatrix_min_expert_samples =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -2116,6 +2149,10 @@ static cli_config parse_options(int argc, char **argv) {
     }
     if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        exit(2);
+    }
+    if (c.gen.imatrix_min_expert_samples < 0) {
+        fprintf(stderr, "ds4: --imatrix-min-expert-samples must not be negative\n");
         exit(2);
     }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
@@ -2284,7 +2321,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_output_path,
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
-                                        cfg.gen.imatrix_max_tokens);
+                                        cfg.gen.imatrix_max_tokens,
+                                        cfg.gen.imatrix_min_expert_samples);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

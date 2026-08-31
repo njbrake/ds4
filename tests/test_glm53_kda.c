@@ -77,7 +77,7 @@ int main(void) {
         D = 128,
         HEADS = 2,
         PROJECTION = HEADS * D,
-        TOKENS = 3,
+        TOKENS = 17,
         Q_CONV_OFFSET = 0,
         K_CONV_OFFSET = 4096,
         V_CONV_OFFSET = 8192,
@@ -275,6 +275,245 @@ int main(void) {
     ds4_gpu_tensor_free(compact_cache_gpu);
     ds4_gpu_tensor_free(compact_raw_gpu);
     ds4_gpu_tensor_free(compact_norm_gpu);
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    enum {
+        DENSE_ATTN_PREFIX = 128,
+        DENSE_ATTN_TOKENS = 256,
+        DENSE_ATTN_CAP = DENSE_ATTN_PREFIX + DENSE_ATTN_TOKENS,
+        DENSE_ATTN_HEADS = 8,
+        DENSE_ATTN_LORA = 512,
+    };
+    const uint64_t dense_attn_cache_count =
+        (uint64_t)DENSE_ATTN_CAP * DENSE_ATTN_LORA;
+    const uint64_t dense_attn_q_count =
+        (uint64_t)DENSE_ATTN_TOKENS * DENSE_ATTN_HEADS * DENSE_ATTN_LORA;
+    float *dense_attn_cache =
+        malloc((size_t)dense_attn_cache_count * sizeof(*dense_attn_cache));
+    float *dense_attn_q =
+        malloc((size_t)dense_attn_q_count * sizeof(*dense_attn_q));
+    float *dense_attn_reference =
+        malloc((size_t)dense_attn_q_count * sizeof(*dense_attn_reference));
+    float *dense_attn_actual =
+        malloc((size_t)dense_attn_q_count * sizeof(*dense_attn_actual));
+    require_ok(dense_attn_cache && dense_attn_q && dense_attn_reference &&
+               dense_attn_actual, "dense compact attention host allocation");
+    for (uint64_t i = 0; i < dense_attn_cache_count; i++) {
+        dense_attn_cache[i] =
+            0.004f * (float)((int)(i % 101u) - 50);
+    }
+    for (uint64_t i = 0; i < dense_attn_q_count; i++) {
+        dense_attn_q[i] =
+            0.003f * (float)((int)(i % 127u) - 63);
+    }
+
+    ds4_gpu_tensor *dense_attn_cache_input_gpu = ds4_gpu_tensor_alloc(
+        dense_attn_cache_count * sizeof(float));
+    ds4_gpu_tensor *dense_attn_cache_gpu = ds4_gpu_tensor_alloc(
+        dense_attn_cache_count * sizeof(uint16_t));
+    ds4_gpu_tensor *dense_attn_rope_gpu = ds4_gpu_tensor_alloc(1u);
+    ds4_gpu_tensor *dense_attn_q_gpu = ds4_gpu_tensor_alloc(
+        dense_attn_q_count * sizeof(float));
+    ds4_gpu_tensor *dense_attn_dummy_q_gpu = ds4_gpu_tensor_alloc(
+        dense_attn_q_count * sizeof(float));
+    ds4_gpu_tensor *dense_attn_reference_gpu = ds4_gpu_tensor_alloc(
+        dense_attn_q_count * sizeof(float));
+    ds4_gpu_tensor *dense_attn_actual_gpu = ds4_gpu_tensor_alloc(
+        dense_attn_q_count * sizeof(float));
+    require_ok(dense_attn_cache_input_gpu && dense_attn_cache_gpu &&
+               dense_attn_rope_gpu && dense_attn_q_gpu &&
+               dense_attn_dummy_q_gpu && dense_attn_reference_gpu &&
+               dense_attn_actual_gpu,
+               "dense compact attention GPU allocation");
+    require_ok(ds4_gpu_tensor_write(
+        dense_attn_cache_input_gpu, 0, dense_attn_cache,
+        dense_attn_cache_count * sizeof(float)),
+        "dense compact attention cache write");
+    require_ok(ds4_gpu_tensor_write(
+        dense_attn_q_gpu, 0, dense_attn_q,
+        dense_attn_q_count * sizeof(float)),
+        "dense compact attention Q write");
+    require_ok(ds4_gpu_tensor_fill_f32(
+        dense_attn_dummy_q_gpu, 0.0f, dense_attn_q_count),
+        "dense compact attention dummy Q clear");
+    require_ok(ds4_gpu_glm_store_compact_kv_tensor(
+        dense_attn_cache_gpu, dense_attn_rope_gpu,
+        dense_attn_cache_input_gpu, dense_attn_cache_input_gpu,
+        0, DENSE_ATTN_CAP, DENSE_ATTN_CAP,
+        DENSE_ATTN_LORA, DENSE_ATTN_LORA, 0, true),
+        "dense compact attention F16 cache store");
+    require_ok(ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+        dense_attn_reference_gpu, dense_attn_dummy_q_gpu,
+        dense_attn_q_gpu, dense_attn_cache_gpu, dense_attn_rope_gpu,
+        DENSE_ATTN_TOKENS, DENSE_ATTN_PREFIX, DENSE_ATTN_CAP,
+        DENSE_ATTN_CAP, true, DENSE_ATTN_HEADS, DENSE_ATTN_LORA,
+        DENSE_ATTN_LORA, 0, 0, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+        "dense compact attention scalar reference");
+    require_ok(ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        dense_attn_actual_gpu, dense_attn_q_gpu, dense_attn_cache_gpu,
+        DENSE_ATTN_PREFIX, DENSE_ATTN_TOKENS, DENSE_ATTN_CAP,
+        DENSE_ATTN_CAP, true, DENSE_ATTN_HEADS, DENSE_ATTN_LORA,
+        DENSE_ATTN_LORA),
+        "dense compact attention GEMM path");
+    require_ok(ds4_gpu_tensor_read(
+        dense_attn_reference_gpu, 0, dense_attn_reference,
+        dense_attn_q_count * sizeof(float)),
+        "dense compact attention reference read");
+    require_ok(ds4_gpu_tensor_read(
+        dense_attn_actual_gpu, 0, dense_attn_actual,
+        dense_attn_q_count * sizeof(float)),
+        "dense compact attention output read");
+    double dense_attn_sq_error = 0.0;
+    float dense_attn_max_error = 0.0f;
+    for (uint64_t i = 0; i < dense_attn_q_count; i++) {
+        const float error = fabsf(
+            dense_attn_actual[i] - dense_attn_reference[i]);
+        dense_attn_max_error = fmaxf(dense_attn_max_error, error);
+        dense_attn_sq_error += (double)error * (double)error;
+    }
+    const double dense_attn_rms_error =
+        sqrt(dense_attn_sq_error / (double)dense_attn_q_count);
+    if (dense_attn_max_error > 5e-4f || dense_attn_rms_error > 1e-4) {
+        fprintf(stderr,
+                "dense compact attention diverged from scalar reference "
+                "(max %.9g, RMS %.9g)\n",
+                dense_attn_max_error, dense_attn_rms_error);
+        return 1;
+    }
+    ds4_gpu_tensor_free(dense_attn_actual_gpu);
+    ds4_gpu_tensor_free(dense_attn_reference_gpu);
+    ds4_gpu_tensor_free(dense_attn_dummy_q_gpu);
+    ds4_gpu_tensor_free(dense_attn_q_gpu);
+    ds4_gpu_tensor_free(dense_attn_rope_gpu);
+    ds4_gpu_tensor_free(dense_attn_cache_gpu);
+    ds4_gpu_tensor_free(dense_attn_cache_input_gpu);
+    free(dense_attn_actual);
+    free(dense_attn_reference);
+    free(dense_attn_q);
+    free(dense_attn_cache);
+
+#endif
+
+#ifdef __APPLE__
+    enum {
+        F32_ATTN_TOKENS = 2,
+        F32_ATTN_HEADS = 8,
+        F32_ATTN_LORA = 512,
+        F32_ATTN_NOPE = 64,
+    };
+    const uint64_t f32_attn_lora_count =
+        (uint64_t)F32_ATTN_TOKENS * F32_ATTN_HEADS * F32_ATTN_LORA;
+    const uint64_t f32_attn_q_count =
+        (uint64_t)F32_ATTN_TOKENS * F32_ATTN_HEADS * F32_ATTN_NOPE;
+    float *f32_attn_low = calloc((size_t)f32_attn_lora_count, sizeof(float));
+    float *f32_attn_q = calloc((size_t)f32_attn_q_count, sizeof(float));
+    float *f32_attn_cache = malloc(
+        (size_t)F32_ATTN_TOKENS * F32_ATTN_LORA * sizeof(float));
+    float *f32_attn_actual = malloc((size_t)f32_attn_lora_count * sizeof(float));
+    require_ok(f32_attn_low && f32_attn_q && f32_attn_cache && f32_attn_actual,
+               "FP32 causal attention host allocation");
+    for (uint32_t row = 0; row < F32_ATTN_TOKENS; row++) {
+        const float value = 1.0f + 2.0f * (float)row;
+        for (uint32_t i = 0; i < F32_ATTN_LORA; i++) {
+            f32_attn_cache[(uint64_t)row * F32_ATTN_LORA + i] = value;
+        }
+    }
+
+    ds4_gpu_tensor *f32_attn_out_gpu =
+        ds4_gpu_tensor_alloc(f32_attn_lora_count * sizeof(float));
+    ds4_gpu_tensor *f32_attn_low_gpu =
+        ds4_gpu_tensor_alloc(f32_attn_lora_count * sizeof(float));
+    ds4_gpu_tensor *f32_attn_q_gpu =
+        ds4_gpu_tensor_alloc(f32_attn_q_count * sizeof(float));
+    ds4_gpu_tensor *f32_attn_cache_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)F32_ATTN_TOKENS * F32_ATTN_LORA * sizeof(float));
+    ds4_gpu_tensor *f32_attn_rope_gpu = ds4_gpu_tensor_alloc(sizeof(float));
+    require_ok(f32_attn_out_gpu && f32_attn_low_gpu && f32_attn_q_gpu &&
+               f32_attn_cache_gpu && f32_attn_rope_gpu,
+               "FP32 causal attention GPU allocation");
+    require_ok(ds4_gpu_tensor_write(f32_attn_low_gpu, 0, f32_attn_low,
+                                    f32_attn_lora_count * sizeof(float)),
+               "FP32 causal attention low-rank Q write");
+    require_ok(ds4_gpu_tensor_write(f32_attn_q_gpu, 0, f32_attn_q,
+                                    f32_attn_q_count * sizeof(float)),
+               "FP32 causal attention Q write");
+    require_ok(ds4_gpu_tensor_write(
+                   f32_attn_cache_gpu, 0, f32_attn_cache,
+                   (uint64_t)F32_ATTN_TOKENS * F32_ATTN_LORA * sizeof(float)),
+               "FP32 causal attention cache write");
+
+    require_ok(ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+                   f32_attn_out_gpu,
+                   f32_attn_low_gpu,
+                   f32_attn_cache_gpu,
+                   0,
+                   F32_ATTN_TOKENS,
+                   F32_ATTN_TOKENS,
+                   F32_ATTN_TOKENS,
+                   false,
+                   F32_ATTN_HEADS,
+                   F32_ATTN_LORA,
+                   F32_ATTN_NOPE),
+               "FP32 dense compact causal attention");
+    require_ok(ds4_gpu_tensor_read(f32_attn_out_gpu, 0, f32_attn_actual,
+                                   f32_attn_lora_count * sizeof(float)),
+               "FP32 dense compact causal attention read");
+    for (uint32_t token = 0; token < F32_ATTN_TOKENS; token++) {
+        const float expected = token == 0 ? 1.0f : 2.0f;
+        for (uint64_t i = (uint64_t)token * F32_ATTN_HEADS * F32_ATTN_LORA;
+             i < (uint64_t)(token + 1u) * F32_ATTN_HEADS * F32_ATTN_LORA;
+             i++) {
+            require_close("FP32 dense compact causal attention",
+                          f32_attn_actual[i], expected, 1e-4f);
+        }
+    }
+
+    require_ok(ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                   f32_attn_out_gpu,
+                   f32_attn_q_gpu,
+                   f32_attn_low_gpu,
+                   f32_attn_cache_gpu,
+                   f32_attn_rope_gpu,
+                   F32_ATTN_TOKENS,
+                   0,
+                   F32_ATTN_TOKENS,
+                   F32_ATTN_TOKENS,
+                   false,
+                   F32_ATTN_HEADS,
+                   F32_ATTN_LORA,
+                   F32_ATTN_NOPE,
+                   0,
+                   0,
+                   0.0f,
+                   0.0f,
+                   0.0f,
+                   1.0f,
+                   0.0f,
+                   0.0f),
+               "FP32 indexed causal attention");
+    require_ok(ds4_gpu_tensor_read(f32_attn_out_gpu, 0, f32_attn_actual,
+                                   f32_attn_lora_count * sizeof(float)),
+               "FP32 indexed causal attention read");
+    for (uint32_t token = 0; token < F32_ATTN_TOKENS; token++) {
+        const float expected = token == 0 ? 1.0f : 2.0f;
+        for (uint64_t i = (uint64_t)token * F32_ATTN_HEADS * F32_ATTN_LORA;
+             i < (uint64_t)(token + 1u) * F32_ATTN_HEADS * F32_ATTN_LORA;
+             i++) {
+            require_close("FP32 indexed causal attention",
+                          f32_attn_actual[i], expected, 1e-4f);
+        }
+    }
+
+    ds4_gpu_tensor_free(f32_attn_rope_gpu);
+    ds4_gpu_tensor_free(f32_attn_cache_gpu);
+    ds4_gpu_tensor_free(f32_attn_q_gpu);
+    ds4_gpu_tensor_free(f32_attn_low_gpu);
+    ds4_gpu_tensor_free(f32_attn_out_gpu);
+    free(f32_attn_actual);
+    free(f32_attn_cache);
+    free(f32_attn_q);
+    free(f32_attn_low);
+#endif
 
 #ifdef DS4_ROCM_BUILD
     enum {

@@ -2,6 +2,10 @@
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/model.gguf make test-metal-session-batch
+ * Optional steering coverage:
+ *   DS4_TEST_DIRECTIONAL_STEERING_FILE=/path/to/direction.f32
+ *   DS4_TEST_DIRECTIONAL_STEERING_FFN=1
+ *   DS4_TEST_DIRECTIONAL_STEERING_ATTN=0.25
  */
 
 #include "ds4.h"
@@ -155,6 +159,19 @@ static float logit_tolerance_from_env(void) {
     return tolerance;
 }
 
+static float steering_scale_from_env(const char *name, float fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    float scale = strtof(value, &end);
+    if (end == value || *end != '\0' || !isfinite(scale) ||
+        scale < -100.0f || scale > 100.0f) {
+        fprintf(stderr, "FAIL: invalid %s=%s\n", name, value);
+        exit(1);
+    }
+    return scale;
+}
+
 static void archive_logits(ds4_session *session, float *dst, int vocab,
                            int session_id, int step) {
     if (ds4_session_copy_logits(session, dst, vocab) != vocab) {
@@ -224,6 +241,15 @@ int main(void) {
         .n_threads = 1,
         .context_size = context_size,
     };
+    const char *steering_file =
+        getenv("DS4_TEST_DIRECTIONAL_STEERING_FILE");
+    if (steering_file && steering_file[0]) {
+        opt.directional_steering_file = steering_file;
+        opt.directional_steering_attn = steering_scale_from_env(
+                "DS4_TEST_DIRECTIONAL_STEERING_ATTN", 0.0f);
+        opt.directional_steering_ffn = steering_scale_from_env(
+                "DS4_TEST_DIRECTIONAL_STEERING_FFN", 1.0f);
+    }
     if (tp_leader) {
         opt.tp.role = DS4_TP_LEADER;
         opt.tp.listen_host = getenv("DS4_TEST_TP_LISTEN_HOST");
@@ -293,6 +319,16 @@ int main(void) {
         if (ds4_session_sync(batched[i], &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: prefill session=%d: %s\n", i, err);
             return 1;
+        }
+    }
+    if (steering_file && steering_file[0] && !tp_leader) {
+        const float initial = opt.directional_steering_ffn;
+        if (ds4_session_directional_steering_ffn(batched[0]) != initial ||
+            ds4_session_set_directional_steering_ffn(batched[0], 0.0f) != 0 ||
+            ds4_session_directional_steering_ffn(batched[0]) != 0.0f ||
+            ds4_session_set_directional_steering_ffn(batched[0], initial) != 0 ||
+            ds4_session_directional_steering_ffn(batched[0]) != initial) {
+            fail("live steering control", 0, -1);
         }
     }
 

@@ -3,7 +3,7 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2**, **GLM 5.3 Flash**, and,
+**DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
 on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
@@ -159,6 +159,14 @@ GLM 5.2 support is limited to the GGUF files tested by this branch:
 GLM 5.3 Flash has its own graph, artifacts, and run instructions in the
 [GLM 5.3 Flash](#glm-53-flash) section below.
 
+The full GLM 5.3 Q2 model is about 197 GiB. It can run resident on a 256 GB
+machine, or with SSD streaming on a smaller system:
+
+```sh
+./download_model.sh glm53-full-q2
+./ds4 -m gguf/GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf --ssd-streaming
+```
+
 The supported GLM 5.2 layout keeps dense/model-control tensors in the existing
 Q8/F32 paths and supports routed expert gate/up tensors in `Q2_K`, `Q4_K`, or
 `Q5_K`; routed expert down tensors are supported in `Q2_K`, `Q4_K`, `Q5_K`, or
@@ -194,6 +202,8 @@ make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make strix-halo       # Linux ROCm, AMD Strix Halo
 make cpu              # CPU-only diagnostics build
 ```
+
+For ROCm packages, GTT configuration and the reproducible ROCm 10.0 container build, see [DS4 on Strix Halo](STRIXHALO.md).
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
@@ -439,8 +449,7 @@ Start with the automatic cache budget:
 ./ds4 -m ./ds4flash.gguf --ssd-streaming
 ```
 
-If startup reports that the expert cache is too large, or if you want to reserve
-more memory for context, set the routed expert cache explicitly:
+To reserve more memory for context, set the routed expert cache explicitly:
 
 ```sh
 ./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
@@ -449,12 +458,13 @@ more memory for context, set the routed expert cache explicitly:
 The `32GB` value is a routed-expert memory budget, not a generic byte cache.
 DwarfStar first reserves headroom for the two full routed layers used by
 overlapped streaming prefill, then converts the remaining bytes to the number of
-dynamic cached experts that fit for the current GGUF. Explicit `NGB` budgets may
-also be capped after context/KV accounting so the backend working set stays out of
-the slow pressure zone. A plain number such as
-`--ssd-streaming-cache-experts 4000` is different: it means exactly 4000 dynamic
-expert slots, with no extra accounting. Non-routed weights, KV cache, graph
-scratch, and activations need additional memory. The automatic cache budget takes
+dynamic cached experts that fit for the current GGUF. This is a target, not a
+promise to allocate that much: DwarfStar reduces it when the model map, graph,
+context, and backend working-set limit leave less room. A plain number such as
+`--ssd-streaming-cache-experts 4000` requests 4000 dynamic expert slots without
+the two-layer reserve, but it can be reduced by the same final memory check.
+Non-routed weights, KV cache, graph scratch, and activations need additional
+memory. The automatic cache budget takes
 80% of the backend's recommended working set, subtracts non-routed weights, then
 applies the same routed-prefill headroom before sizing the dynamic cache. Leave
 the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
@@ -516,8 +526,9 @@ cache. Start with the automatic budget:
   --ctx 32768
 ```
 
-The important startup line is the cache report. Start conservative, then
-increase the cache if the machine has headroom.
+The startup report shows the effective cache and whether GLM decode uses one
+global model map or the lower-memory per-layer fallback. Start conservative,
+then increase the cache if the machine has headroom.
 
 On a 128GB Strix Halo, use the routed Q2_K model and a 4096-token context as the
 starting point. The automatic cache budget leaves room for the GLM graph and KV
@@ -1690,14 +1701,28 @@ CUDA.
 
 ## Steering
 
-This project supports steering with single-vector activation directions; see the
-`dir-steering` directory for more information. This follows the core idea of the
+DeepSeek V4 Flash and GLM 5.3 Flash support steering with single-vector
+activation directions; see the `dir-steering` directory for examples,
+model-specific shapes, and build instructions. This follows the core idea of the
 [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
 paper. You can use it to make the model more or less verbose, less likely to
 answer programming questions if it is a chatbot for your car rental web site,
 and so forth, much faster than fine-tuning.
 This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
+
+Load a direction when starting either interactive client:
+
+```sh
+./ds4 -m model.gguf --dir-steering-file direction.f32
+./ds4-agent -m model.gguf --dir-steering-file direction.f32
+```
+
+The default FFN scale is `1`. At an interactive prompt, `/steer` shows the
+current scale, `/steer 0` disables it, and `/steer F` sets a value from `-100`
+to `100` for subsequent tokens. The existing KV cache is kept. Live changes
+are currently limited to local sessions, not distributed inference or network
+tensor parallelism.
 
 ## Test Vectors
 

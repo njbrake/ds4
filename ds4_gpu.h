@@ -2494,6 +2494,10 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_dspark_gfx1151_fast_path(void);
+void ds4_gpu_set_dspark_verify_mode(bool enabled);
+#endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -2932,6 +2936,19 @@ int ds4_gpu_glm53_matmul_bf16(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+int ds4_gpu_glm53_matmul_bf16_qkv(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x);
 
 #ifndef DS4_GLM53_VISION_TYPES_DEFINED
 #define DS4_GLM53_VISION_TYPES_DEFINED
