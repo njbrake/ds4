@@ -13542,8 +13542,14 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
+    /* Advertise image input when a vision encoder is loaded, so capability-aware
+     * clients (and gateways) will actually send images instead of refusing.
+     * Emit both the flat input/output_modalities fields and the OpenRouter-style
+     * architecture object, since clients disagree on which they read. */
+    const char *in_mods = vision ? "\"text\",\"image\"" : "\"text\"";
+    const char *modality = vision ? "text+image->text" : "text->text";
     buf_printf(b,
         "{\"id\":");
     json_escape(b, id);
@@ -13560,6 +13566,12 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
+        "\"input_modalities\":[%s],"
+        "\"output_modalities\":[\"text\"],"
+        "\"architecture\":{"
+            "\"modality\":\"%s\","
+            "\"input_modalities\":[%s],"
+            "\"output_modalities\":[\"text\"]},"
         "\"supported_parameters\":["
             "\"tools\","
             "\"tool_choice\","
@@ -13574,7 +13586,10 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"reasoning_effort\"]}",
         ctx,
         ctx,
-        max_completion);
+        max_completion,
+        in_mods,
+        modality,
+        in_mods);
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
@@ -13582,7 +13597,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -17945,15 +17961,18 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    /* Text-only model must not advertise image input. */
+    TEST_ASSERT(strstr(b.ptr, "\"image\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "text->text") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
